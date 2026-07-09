@@ -203,7 +203,8 @@ The repository ships a ready-to-run tool, [`patch_ae.py`](patch_ae.py). It:
    ramp (a monotonic array whose next array is flat), never a hard-coded offset,
 4. sets it to your value and fixes the **uITRON partition checksum** and the **whole-file CRC**
    in the correct order,
-5. **verifies** the result and reports the byte diff.
+5. **verifies** the result **in memory before writing**, writes the file **atomically**, then
+   re-checks it **round-trip** from disk — so it never leaves a half-written or invalid image.
 
 ```bash
 python3 patch_ae.py FWHC940A.bin                 # tab_ratio_ir -> 55, writes FWHC940A_patched.bin
@@ -212,6 +213,9 @@ python3 patch_ae.py FWHC940A.bin --iso-cap 3200       # also cap iso_prv.h (e.g.
 python3 patch_ae.py FWHC940A.bin --dry-run            # analyse & locate only, write nothing
 python3 patch_ae.py FWHC940A.bin --verify-only        # only check a file's checksums
 python3 patch_ae.py FWHC940A.bin --uit-off 0x1878 --uit-size 7240660   # manual override
+python3 patch_ae.py FWHC940A.bin --ir-offset 0x6cb628                 # choose one table explicitly
+python3 patch_ae.py FWHC940A.bin --all               # patch ALL tab_ratio_ir tables if several exist
+python3 patch_ae.py FWHC940A.bin --version           # print the tool version
 ```
 
 Verified output on HC-960Ultra-li:
@@ -220,13 +224,25 @@ Verified output on HC-960Ultra-li:
 [i] uITRON partition: off=0x1878 size=7240660 (0x6e7bd4)
 [ok] self-test: uITRON cksum @+0x6e=0x1a2d reproduced; file CRC @0x24=0x4044 calc=0x4044
 [i] tab_ratio_ir @ file 0x6cb628 = 110 x21
-[patch] tab_ratio_ir 110 -> 55
+[patch] tab_ratio_ir @0x6cb628 110 -> 55
 [cksum] uITRON 0x1a2d->0x1eb0   file CRC 0x4044->0x4044
-[verify] uITRON checksum: OK   file CRC: OK
+[verify] on-disk uITRON checksum: OK   file CRC: OK
 [done] wrote FWHC940A_patched.bin  (bytes changed: 23)
 ```
 
 If the **self-test fails**, your build uses different offsets — see section 11 (Generalizing).
+
+### Troubleshooting
+
+- **"N tab_ratio_ir candidates" / wrong table patched** — pass `--ir-offset 0x<offset>` to choose
+  one (the offsets are printed), or `--all` to patch every table.
+- **"checksum self-test failed for every candidate offset"** — a newer container variant; find the
+  right offsets with `NTKFWinfo -i` and pass `--uit-off/--uit-size`.
+- **"could not auto-detect uITRON"** — pass `--uit-off/--uit-size` from `NTKFWinfo -i`.
+- **"original file CRC mismatch"** — the input looks already modified; re-extract a clean firmware
+  (or add `--force` if you understand the risk).
+- Nothing is written unless **both checksums verify**; on any failure the tool exits non-zero and
+  writes no file.
 
 ## 8. Step 5 — Independently verify with NTKFWinfo
 

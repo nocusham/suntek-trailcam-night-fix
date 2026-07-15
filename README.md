@@ -1,324 +1,363 @@
 # Fixing night-photo overexposure on Suntek / Novatek trail cameras
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**English** | [中文](README.zh-CN.md)
+English | [中文](README.zh-CN.md)
 
-A complete, reproducible guide to **diagnose and fix chronic night (IR) over‑exposure** on
-Suntek/Novatek‑platform trail cameras (e.g. **HC‑940Ultra, HC‑950Ultra, HC‑960Ultra‑li** and
-siblings), by correcting the auto‑exposure (AE) tuning **inside the firmware** and re‑computing the
-firmware checksums so the patched image boots and flashes normally.
+This project analyzes and patches excessive night/IR auto-exposure in selected
+Suntek trail-camera firmware based on the Novatek `NVTPACK_FW_HDR2` platform.
+The patch changes the firmware's `tab_ratio_ir` target curve and recalculates all
+affected checksums so that the image remains internally consistent.
 
-> **This has been verified end‑to‑end on a real HC‑960Ultra‑li:** the patched firmware flashed via
-> SD card, booted, and reduced fully‑blown‑white pixels in night shots from ~22 % to ~1 %.
+Version 2 fixes an important architectural detail: the examined firmware images
+contain **two independent camera runtimes**. The normal/network runtime handles
+remote captures, while a second low-power runtime handles PIR wake-up captures.
+Each runtime has its own AE table. Patching only the first one can fix remote
+photos while PIR photos remain overexposed.
 
----
+## Safety warning
 
-## ⚠️ Read this first — risk & disclaimer
+Flashing modified firmware can permanently brick a camera. There is no warranty
+and no guarantee that a firmware image is compatible with another hardware
+revision, even when the model name looks identical.
 
-Modifying and flashing firmware can **brick your camera**. You do this **at your own risk**; there is
-no warranty and the authors accept no liability. Mitigate the risk:
+- Keep an untouched copy of the exact original firmware.
+- Run `--verify-only` and `--dry-run` before writing or flashing anything.
+- Compare the SHA-256 hash with the verified profile table below.
+- Test with physical access to the camera and preferably a 3.3 V UART recovery
+  connection.
+- Never flash an output after an error or interrupted operation.
 
-- **Keep the original, unmodified firmware file** for your exact model to restore if needed.
-- Only change **data bytes**; never change the file length.
-- **Always run the checksum self‑test** (below) before flashing — a wrong checksum yields an image
-  that fails to boot.
-- Prefer to test with **physical access** to the camera (not remotely).
+This repository contains tooling and documentation only. It does not distribute
+manufacturer firmware.
 
-The good news: on the SD‑update path of this platform, an image with **incorrect** checksums is
-**rejected before writing** (the camera keeps working) rather than half‑flashed. That makes a careful
-attempt relatively safe — but treat bricking as possible anyway.
+## Tested firmware profiles
 
----
+Automatic profiles are selected only when the input BIN has an exact known
+SHA-256 hash.
 
-## Repository contents
+| Profile | Model/build | Original BIN SHA-256 | Original IR curve | Target curve |
+|---|---|---|---|---|
+| `hc960-ae55` | HC-960Ultra, 2026-03-26 | `b391abec2bdf6ab1d48e357c94e0f56bb9e2703899b647609acec3faa30150fa` | `110 x21` | `55 x21` |
+| `hc940-ae58` | HC-940Ultra, 2025-04-23 | `9eb10ef5dd4057a891fb48a2b9cb9165e9ae3168a9b7e58aecc6299b90749c4a` | `110..125` | `58..66` |
 
-- [`patch_ae.py`](patch_ae.py) — the patch tool (self-test, auto-locate, patch, checksum, verify).
-- [`README.md`](README.md) / [`README.zh-CN.md`](README.zh-CN.md) — this guide (English / 中文).
-- [`LICENSE`](LICENSE) — MIT (covers the tool & docs only; no firmware is distributed).
+The HC-940Ultra target is the following 21-entry test curve:
 
-> This project does **not** include any manufacturer firmware — you supply your own model's file.
+```text
+58, 58, 58, 58, 58, 58, 58,
+58, 58, 58, 58, 58, 58, 61,
+63, 66, 66, 66, 66, 66, 66
+```
 
----
+It was derived from comparison images after a flat value of 55 removed nearly
+all clipping while retaining usable subject detail. The `58..66` curve preserves
+the shape of the manufacturer's original `110..125` curve and uses some of the
+remaining exposure headroom. It is a research/test calibration, not a vendor
+release.
 
-## 1. The problem
-
-At night the camera switches to IR mode. On affected units the AE engine targets a **luminance that
-is too high for IR**, so it pushes ISO/exposure until **near subjects (an animal a few metres away)
-are blown to pure white**, while daytime photos are fine. Vendor advice ("set ISO to 100 in the
-menu") only partially helps because it is a blunt cap; the real cause is one AE parameter.
-
-**Root cause:** the AE night/IR luminance‑ratio table **`tab_ratio_ir`** is set to **110 %** (higher
-than the daytime maximum of 100 %). Lowering it (e.g. to **55**) fixes the over‑exposure at its source.
-
-This is **not** an IR‑LED‑power problem: covering the LEDs does not help, because the AE simply raises
-gain to reach its (too‑high) target.
-
----
-
-## 2. Platform background (what's inside)
-
-- SoC: **Novatek NA51023** (marketing name **NT96670**), dual‑CPU MIPS32.
-  - **CPU1**: µITRON/eCos RTOS — camera pipeline, ISP, **AE**, on‑screen menu. *The fix lives here.*
-  - **CPU2**: Linux — 4G/WiFi, cloud.
-- Boot: internal ROM → loader (`LD_NVT`) → **u‑boot** → copies the **µITRON** image to RAM and starts
-  it. **u‑boot checks the µITRON partition checksum on every boot**, so a patched image must carry a
-  correct checksum or it will not boot.
-- Firmware file format: **`NVTPACK_FW_HDR2`** — a container with a header, a partition table, and
-  several partitions: two `MODELEXT` config blobs, the **main µITRON** image (where AE tuning lives),
-  u‑boot, a Linux `uImage`, a `UBIFS` root filesystem, and a **second µITRON copy**.
-- AE/IQ/AWB tuning is embedded in the µITRON as a named lib **`AE_PARAM_<SENSOR>_EVB`**
-  (e.g. `AE_PARAM_SC2210_EVB` for the SmartSens SC2210 sensor). There is **no SD/runtime override**
-  for it (the `A:\ntscript.txt` script engine exists but is **not** auto‑executed on normal boots),
-  so the only reliable persistent fix is to patch the firmware image.
-
----
-
-## 3. Prerequisites
-
-**Software**
-- **Python 3** (with the standard `struct`, `array` modules).
-- **NTKFWinfo** — the Novatek firmware toolkit by EgorKin:
-  `git clone https://github.com/EgorKin/Novatek-FW-info` (repo also called *NTKFWinfo*). It parses
-  `NVTPACK_FW_HDR2`, lists partitions, and verifies CRCs. We use it to confirm the format and to
-  independently verify our patched file.
-- **Pillow** (`pip install pillow`) — optional, for measuring over‑exposure in test JPGs.
-
-**Hardware**
-- An **SD card** (the camera flashes firmware from the card root on boot).
-- **Optional but very helpful: a 3.3 V USB‑UART adapter** to reach the camera's serial console.
-  It lets you read the live AE table with `ae aetdump 0` and confirm values. (Reaching the UART pads
-  usually requires opening the camera.)
-
-**Files**
-- The **exact firmware** for your model (the camera's own SD‑update `.bin`, or from the vendor).
-  Keep a pristine copy.
-
----
-
-## 4. Step 1 — Inspect the firmware with NTKFWinfo
+Run this to print profiles and hashes:
 
 ```bash
-git clone https://github.com/EgorKin/Novatek-FW-info
-cd Novatek-FW-info
-python3 NTKFWinfo.py -i /path/to/FWHC940A.bin
+python3 patch_ae.py --list-profiles
 ```
 
-You should see something like:
+## Why both runtimes must be patched
 
-```
-NVTPACK_FW_HDR2 found
-Found 7 partitions
-Firmware file ORIG_CRC:0x4044  CALC_CRC:0x4044          <- format & CRC confirmed
- ID   START_OFFSET   END_OFFSET        SIZE      ORIG_CRC  CALC_CRC   TYPE
-  1   0x000000D4  - 0x00000CB8         3,044     0xC55C    0xC55C     MODELEXT INFO: Chip:NT96670 ...
-  2   0x00000CB8  - 0x00001878         3,008     0xFEF8    0xFEF8     MODELEXT INFO: Chip:NT96670 ...
-  3   0x00001878  - 0x006E944C     7,240,660     0x0000    0x0000     unknown partition   <- µITRON (main)
-  4   ...                                                              (u-boot)
-  6   ...                                                              uImage (Linux)
-  7   ...                                                              CKSM UBIFS  (rootfs)
-  9   0x015B7D1C  - 0x01E2B004     8,860,392     0x0000    0x0000     unknown partition   <- 2nd µITRON copy
-```
+The examined HC-940Ultra and HC-960Ultra images contain:
 
-**Write down** the **main µITRON partition** row (the large *unknown partition* whose data starts with
-a `0x027004xx` load address). Note its **START_OFFSET** and **SIZE** — you'll need them. These values
-**differ between models and firmware versions**, so never assume; always read them here.
+| Runtime | Typical partition | Load address | Function |
+|---|---:|---:|---|
+| Normal runtime | ID 3 | `0x02700400` | menu, network, remote capture, Linux/4G host path |
+| Low-power runtime | ID 9 | `0x00400400` | PIR wake-up, standalone/low-power capture |
 
-> `ORIG_CRC == CALC_CRC` on the file line confirms the container format and that the checksum family
-> used below is correct.
+Both contain a separate sequence of three 21-entry AE curves:
 
----
-
-## 5. Step 2 — Diagnose the AE parameter
-
-### Option A — UART console (best)
-Connect the UART, power the camera, and type:
-
-```
-ae aetdump 0
+```text
+tab_ratio_mov
++0x54  tab_ratio_photo
++0xA8  tab_ratio_ir
 ```
 
-Look at the `expect_lum` block. A faulty unit shows:
+In the examined SDK layout, a characteristic `over_exposure` threshold pair is
+found at `tab_ratio_ir + 0x25c`. Version 2 uses this structure, partition
+boundaries, runtime checksums, and ambiguity checks instead of relying on one
+hard-coded table offset.
 
+## Requirements
+
+- Python 3.10 or newer.
+- The original manufacturer `.bin`, or a `.zip` containing exactly one firmware
+  `.bin`.
+- No third-party Python packages are required.
+
+Optional independent inspection:
+
+- [Novatek-FW-info / NTKFWinfo](https://github.com/EgorKin/Novatek-FW-info)
+- A 3.3 V USB-UART adapter for console diagnosis and recovery.
+
+## Quick start
+
+### 1. Verify the original image
+
+```bash
+python3 patch_ae.py firmware.zip --verify-only
 ```
-data.tExpectLum.expect_lum.tab_ratio_mov = { 44, 48, 52, ... 100, 100 }   (day: caps at 100)
-data.tExpectLum.expect_lum.tab_ratio_ir  = { 110, 110, ... 110 }          (night: 110 = TOO HIGH)
-...
-data.tBoundary.proc_boundary.iso_prv.h   = 12800                          (ISO ceiling)
+
+The command checks the whole-file checksum and every internal partition checksum
+that can be identified by its Novatek `55 aa` checksum marker. On the tested
+images this includes the two configuration partitions, both camera runtimes,
+and the bootloader.
+
+### 2. Scan the runtimes and original curves
+
+```bash
+python3 patch_ae.py firmware.zip --scan
 ```
 
-`tab_ratio_ir > 100` (typically flat **110**) is the confirmed fault. Also note there is a single AE
-instance (typing `ae dumpcurve 1` causes a CPU exception), so this one value controls both preview and
-capture.
+Expected output includes one normal/remote runtime and one low-power/PIR runtime.
+Stop if the result is ambiguous or does not match the expected camera build.
 
-### Option B — No UART (image analysis)
-Take a night photo, then measure how much of it is blown to white:
+### 3. Preview the automatic patch
+
+For either exact profile listed above:
+
+```bash
+python3 patch_ae.py firmware.zip --dry-run
+```
+
+The input SHA-256 selects the appropriate profile. Nothing is written.
+
+### 4. Create the patched image
+
+```bash
+python3 patch_ae.py firmware.zip
+```
+
+- ZIP input defaults to `firmware_patched.zip` and preserves the archive layout.
+- BIN input defaults to `firmware_patched.bin`.
+- The input file is never overwritten.
+- Existing output files require `--overwrite`.
+
+Create a JSON audit manifest at the same time:
+
+```bash
+python3 patch_ae.py firmware.zip --manifest patch-manifest.json
+```
+
+### 5. Verify the produced image again
+
+```bash
+python3 patch_ae.py firmware_patched.zip --verify-only
+```
+
+The tool also performs this check automatically after writing. A failed
+round-trip check deletes the output.
+
+## Custom curve modes
+
+Unknown firmware has no automatic target. After reviewing `--scan`, select one
+of these explicit modes.
+
+### Flat curve
+
+Backward-compatible behavior, setting all 21 entries to the same value:
+
+```bash
+python3 patch_ae.py firmware.bin --ir 55
+```
+
+### Scale the existing curve
+
+Preserves the curve shape:
+
+```bash
+python3 patch_ae.py firmware.bin --ir-scale 0.50
+```
+
+For example, `110,115,120,125` becomes approximately `55,58,60,63`.
+
+### Explicit 21-entry curve
+
+```bash
+python3 patch_ae.py firmware.bin --ir-values \
+  58,58,58,58,58,58,58,58,58,58,58,58,58,61,63,66,66,66,66,66,66
+```
+
+The values must be in `1..255` and monotonic non-decreasing.
+
+## Runtime and offset selection
+
+All detected runtimes are patched by default. Limiting the patch is an expert
+operation and can intentionally leave one trigger path unchanged.
+
+```bash
+python3 patch_ae.py firmware.bin --runtime normal --ir 55
+python3 patch_ae.py firmware.bin --runtime pir --ir 55
+python3 patch_ae.py firmware.bin --runtime pid:9 --ir-scale 0.50
+```
+
+Selectors are repeatable. The deprecated `--all` option is accepted but no
+longer changes behavior.
+
+A manually confirmed IR-table offset can be supplied and is validated against
+its containing partition and surrounding AE structure:
+
+```bash
+python3 patch_ae.py firmware.bin --ir-offset 0x006cb628 --ir 55
+```
+
+Repeat `--ir-offset` to patch multiple explicitly selected tables.
+
+## ISO cap: explicit offsets only
+
+Version 1 searched for the first plausible `{iso_prv.h, 100}` pair. That pattern
+is not unique enough for safe automatic patching. Version 2 requires a manually
+verified offset:
+
+```bash
+python3 patch_ae.py firmware.bin --ir 55 \
+  --iso-cap 3200 --iso-offset 0x123456
+```
+
+The offset must be aligned, inside a selected AE runtime, contain a plausible ISO
+value, and be followed by `iso_prv.l = 100`. Repeat `--iso-offset` when separate
+runtime copies must both be changed.
+
+## What version 2 validates
+
+Before patching:
+
+1. `NVTPACK_FW_HDR2` version marker.
+2. Partition-table pointer from header offset `0x14` and count from `0x18`.
+3. Records in the actual order `{offset, size, partition_id}`.
+4. Partition bounds and overlap.
+5. Whole-file checksum.
+6. Every detectable internal partition checksum.
+7. Exactly one unambiguous AE structure per selected runtime.
+8. Profile SHA-256 and expected original curve, when a profile is used.
+
+After patching:
+
+1. Every changed runtime receives a recalculated internal checksum.
+2. The whole-file checksum is recalculated afterward.
+3. Target curves and optional ISO fields are read back exactly.
+4. A byte-level whitelist rejects changes outside requested data and checksum
+   fields.
+5. The output is written through a unique temporary file and atomically renamed.
+6. The BIN is read back from disk or ZIP and verified again.
+
+The Novatek checksum is a position-weighted, additive 16-bit two's-complement
+checksum. The implementation explicitly interprets words as little-endian and
+writes the outer field as 16 bits.
+
+## Diagnosing image quality
+
+A useful test sequence keeps the camera and scene unchanged and captures both
+remote and PIR images. Include bright foreground vegetation and a darker subject
+farther away.
+
+A simple clipping measurement, excluding the camera's bottom information bar:
 
 ```python
 from PIL import Image
-im = Image.open("night.jpg").convert("L")
-h = im.histogram(); tot = sum(h)
-print("pure white (255): %.1f%%" % (h[255]/tot*100))
+
+image = Image.open("night.jpg").convert("L")
+image = image.crop((0, 0, image.width, image.height - 100))
+histogram = image.histogram()
+total = sum(histogram)
+print("pixels >= 250: %.2f%%" % (sum(histogram[250:]) / total * 100))
+print("pixels == 255: %.2f%%" % (histogram[255] / total * 100))
 ```
 
-A large fraction (~20 %+) at 255 indicates severe clipping. Use the same measure later to confirm the fix.
-
----
-
-## 6. Step 3 — Understand the two checksums
-
-After editing the µITRON you must fix **two** checksums, or the camera will reject/not boot the image:
-
-1. **µITRON partition internal checksum** — u‑boot checks this every boot. It is a 16‑bit value stored
-   right after the magic bytes `55 aa` inside the partition header, at **partition offset `0x6E`**.
-2. **Whole‑file CRC** — the updater's file check. A 16‑bit value stored at **file offset `0x24`**.
-
-Both use the **same algorithm**: a position‑weighted 16‑bit two's‑complement sum. Reference
-implementation (equivalent to NTKFWinfo's `MemCheck_CalcCheckSum16Bit`):
-
-```python
-import array
-def ntk_cksum16(buf, off, length, ignore_off):
-    n = length // 2
-    a = array.array('h')                        # signed 16-bit little-endian words
-    a.frombytes(bytes(buf[off:off + n*2]))
-    a[ignore_off // 2] = 0                       # zero the word that holds the checksum itself
-    s = (sum(a) + (n - 1) * n // 2) & 0xFFFF     # sum of words + triangular number n*(n-1)/2
-    return ((~s & 0xFFFF) + 1) & 0xFFFF          # two's complement (negate)
-```
-
-- MODELEXT partitions use `ignore_off = 0x36`; the µITRON uses `ignore_off = 0x6E`; the file uses
-  `ignore_off = 0x24`.
-- The **range** is the whole partition for a partition checksum, and the whole file for the file CRC.
-
----
-
-## 7. Step 4 — Patch with `patch_ae.py`
-
-The repository ships a ready-to-run tool, [`patch_ae.py`](patch_ae.py). It:
-
-1. **self-tests** the checksum algorithm against your firmware (and aborts if the offsets differ),
-2. **auto-detects** the main uITRON partition from the partition table,
-3. **locates `tab_ratio_ir` by structure** — sensor-independent: it anchors on the `tab_ratio_mov`
-   ramp (a monotonic array whose next array is flat), never a hard-coded offset,
-4. sets it to your value and fixes the **uITRON partition checksum** and the **whole-file CRC**
-   in the correct order,
-5. **verifies** the result **in memory before writing**, writes the file **atomically**, then
-   re-checks it **round-trip** from disk — so it never leaves a half-written or invalid image.
+Pillow is needed only for this optional analysis:
 
 ```bash
-python3 patch_ae.py FWHC940A.bin                 # tab_ratio_ir -> 55, writes FWHC940A_patched.bin
-python3 patch_ae.py FWHC940A.bin -o out.bin --ir 45   # custom output + value (lower = darker night)
-python3 patch_ae.py FWHC940A.bin --iso-cap 3200       # also cap iso_prv.h (e.g. 12800 -> 3200)
-python3 patch_ae.py FWHC940A.bin --dry-run            # analyse & locate only, write nothing
-python3 patch_ae.py FWHC940A.bin --verify-only        # only check a file's checksums
-python3 patch_ae.py FWHC940A.bin --uit-off 0x1878 --uit-size 7240660   # manual override
-python3 patch_ae.py FWHC940A.bin --ir-offset 0x6cb628                 # choose one table explicitly
-python3 patch_ae.py FWHC940A.bin --all               # patch ALL tab_ratio_ir tables if several exist
-python3 patch_ae.py FWHC940A.bin --version           # print the tool version
+python3 -m pip install pillow
 ```
 
-Verified output on HC-960Ultra-li:
+A curve cannot be uniquely reconstructed from clipped JPEGs alone. The images do
+not reveal which of the 21 AE indices was active, and pure-white pixels have
+already lost their original brightness. Use several controlled test captures
+before deciding that a curve is final.
 
-```
-[i] uITRON partition: off=0x1878 size=7240660 (0x6e7bd4)
-[ok] self-test: uITRON cksum @+0x6e=0x1a2d reproduced; file CRC @0x24=0x4044 calc=0x4044
-[i] tab_ratio_ir @ file 0x6cb628 = 110 x21
-[patch] tab_ratio_ir @0x6cb628 110 -> 55
-[cksum] uITRON 0x1a2d->0x1eb0   file CRC 0x4044->0x4044
-[verify] on-disk uITRON checksum: OK   file CRC: OK
-[done] wrote FWHC940A_patched.bin  (bytes changed: 23)
-```
+## Flashing
 
-If the **self-test fails**, your build uses different offsets — see section 11 (Generalizing).
+The exact update filename and procedure can vary by build. Commonly the patched
+BIN inside the ZIP is named `FWHC940A.bin` and is copied to the SD-card root.
+Confirm the expected name and recovery method for your camera before flashing.
 
-### Troubleshooting
+After flashing, test:
 
-- **"N tab_ratio_ir candidates" / wrong table patched** — pass `--ir-offset 0x<offset>` to choose
-  one (the offsets are printed), or `--all` to patch every table.
-- **"checksum self-test failed for every candidate offset"** — a newer container variant; find the
-  right offsets with `NTKFWinfo -i` and pass `--uit-off/--uit-size`.
-- **"could not auto-detect uITRON"** — pass `--uit-off/--uit-size` from `NTKFWinfo -i`.
-- **"original file CRC mismatch"** — the input looks already modified; re-extract a clean firmware
-  (or add `--force` if you understand the risk).
-- Nothing is written unless **both checksums verify**; on any failure the tool exits non-zero and
-  writes no file.
+1. Normal boot and menu operation.
+2. Remote night capture.
+3. PIR wake-up night capture.
+4. Several consecutive PIR captures to detect AE settling differences.
+5. Day images, video, storage, and network functions.
 
-## 8. Step 5 — Independently verify with NTKFWinfo
+Static analysis and valid checksums do not prove compatibility with every camera
+revision.
+
+## Troubleshooting
+
+### Input checksum mismatch
+
+Use a pristine manufacturer image. Version 2 deliberately has no broad `--force`
+option that can turn a damaged input into a checksum-consistent but unknown
+output.
+
+### No automatic profile
+
+Run `--scan`, compare the firmware build and curves, then use `--ir-scale`,
+`--ir`, or `--ir-values`. Do not select a model profile for a different hash.
+
+### No AE runtime found
+
+The firmware may use a different SDK structure. Obtain UART output such as
+`ae aetdump 0`, inspect the image manually, and use `--ir-offset` only after the
+table and containing partition are confirmed.
+
+### Multiple AE structures found
+
+The tool stops rather than guessing. Use a manually verified `--ir-offset`, or
+add support for the new layout with test firmware and regression checks.
+
+### Only one runtime found
+
+Some firmware may genuinely contain one camera runtime. On the examined
+HC-940Ultra and HC-960Ultra builds, two are expected. Do not assume PIR is fixed
+until a PIR image has been tested.
+
+## Development and regression checks
+
+Before publishing a change to `patch_ae.py`, test at least:
 
 ```bash
-python3 NTKFWinfo.py -i FWHC940A_patched.bin
+python3 -m py_compile patch_ae.py
+python3 patch_ae.py HC960-original.zip --dry-run
+python3 patch_ae.py HC940-original.zip --dry-run
+python3 patch_ae.py HC960-original.zip --verify-only
+python3 patch_ae.py HC940-original.zip --verify-only
 ```
 
-Confirm `Firmware file ORIG_CRC == CALC_CRC` (green) and that all recognized partitions are still
-valid. (NTKFWinfo treats the µITRON as "unknown"/CRC 0x0000 — that's expected; its internal checksum
-is the one your script fixed and verified.)
+Expected automatic-profile BIN hashes:
 
----
+```text
+HC-960Ultra: a66190b5f418a2e54c09042f154411777bb2b3f7ec339023a1331442600c4667
+HC-940Ultra: a0a7b94cc9e1c4e7da51b8ddf4c8b18a619d2acecf8b874247ca3669e5bf9a53
+```
 
-## 9. Step 6 — Flash and confirm
+No manufacturer firmware or patched firmware should be committed to this
+repository.
 
-1. Rename the patched file to the update name your camera expects (commonly **`FWHC940A.bin`**) and
-   copy it to the **root of the SD card**. Keep the original elsewhere for restore.
-2. Insert the card and power the camera; it flashes on boot. (In the UART log you'll see
-   `uiFWUpdate…`, `upd_src_size=…`, then a normal boot.)
-3. Confirm the change:
-   - UART: `ae aetdump 0` should now show `tab_ratio_ir = { 55, … }`.
-   - Real night photo: re‑run the histogram measurement — the pure‑white fraction should drop sharply
-     (in the verified case, ~22 % → ~1 %).
+## Credits
 
----
-
-## 10. Tuning & options
-
-- **`tab_ratio_ir` value**: `55` is a good starting point (≈ −1 stop of night target). For stronger
-  taming of very close, bright subjects use `45` or `40`; for a brighter night image use `60`–`70`.
-  Because flashing works reliably once the checksum is correct, you can iterate: change the value,
-  re‑run the script, re‑flash, compare a night photo.
-- **ISO ceiling** (`iso_prv.h`, e.g. `12800 → 3200`): set `NEW_ISO_PRV_H` in the script to cap ISO in
-  Auto mode without lowering the general night target. Useful against ISO run‑away on near subjects.
-- **Menu ISO options**: on some models the menu shows only `Auto/100/200/400` because only those
-  option **strings** exist in the firmware — the AE can still use higher ISO internally. Prefer the
-  `iso_prv.h` patch over trying to add menu entries (which requires far riskier UI/table surgery).
-
----
-
-## 11. Generalizing to other models / sensors / firmware versions
-
-- **Different sensor/driver** (not SC2210): the AE lib is `AE_PARAM_<SENSOR>_EVB`; the AE **struct
-  layout is identical**. Diagnose with `ae aetdump 0` and locate `tab_ratio_ir` by content — the
-  script's anchor logic (flat 21‑array followed by `over_exposure`) is sensor‑independent.
-- **Different model / newer firmware**: partition offsets and the AE‑struct file offset **change**.
-  Always re‑read them with `NTKFWinfo -i`, set the CONFIG at the top of the script, and rely on the
-  **self‑test** to confirm the checksum offsets (`0x24`/`0x36`/`0x6E`) are still correct.
-- **If the self‑test fails**: the container may be a newer variant. NTKFWinfo tries partition
-  `ignoreCRCoffset` values `{0x6E, 0x16E, 0x26E, 0x36E, 0x46E}` and file `0x24`; sweep these until
-  `ntk_cksum16` reproduces the stored value, then use that offset.
-
----
-
-## 12. Troubleshooting / fallback
-
-- **Update seems ignored / rejected**: the camera keeps the old firmware (safe). Re‑check the file
-  name and that checksums are correct. If the model's SD path adds a signature check, use the u‑boot
-  console instead: interrupt boot, then (addresses/lengths from your partition table)
-  `fatload mmc 0 <ram_addr> <part>.bin; sf erase <flash_off> <len>; sf write <ram_addr> <flash_off> <len>; reset`.
-  This bypasses the updater; only u‑boot's boot‑time µITRON checksum matters (which you fixed).
-  The same SoC and console commands are documented in `github.com/hn/reolink-camera`.
-- **Camera doesn't boot after flashing**: re‑flash the pristine original firmware.
-
----
-
-## Credits & references
-
-- **NTKFWinfo** — `github.com/EgorKin/Novatek-FW-info` — Novatek `NVTPACK_FW_HDR2` parser and CRC
-  logic (the checksum algorithm here is derived from its `MemCheck_CalcCheckSum16Bit`).
-- **hn/reolink-camera** — `github.com/hn/reolink-camera` — NA51023 boot process and u‑boot flashing
-  commands reference.
+- [Novatek-FW-info / NTKFWinfo](https://github.com/EgorKin/Novatek-FW-info)
+  for public documentation and checksum parsing references.
+- Contributors who supplied original firmware hashes, runtime analysis, and
+  controlled night-image comparisons.
 
 ## License
 
-[MIT](LICENSE) — for the **tooling and documentation in this repository only**. It does **not**
-cover, and this repository does **not** distribute, any manufacturer firmware; you supply your own.
-"Novatek", "Suntek" and other names are trademarks of their respective owners. Provided **as-is,
-without warranty**; flashing firmware is at your own risk (see the warning at the top).
+[MIT](LICENSE) for the tool and documentation only. Manufacturer firmware,
+Suntek and Novatek trademarks, and camera hardware are not covered by this
+license. Provided as-is; flashing is at your own risk.

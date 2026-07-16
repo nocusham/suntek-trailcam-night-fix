@@ -4,6 +4,167 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [Semantic Versioning](https://semver.org/).
 
+
+## [3.0.0] - 2026-07-16
+
+### Added
+
+- Four explicit firmware support levels:
+  - `verified` for an exact trusted BIN SHA-256 profile;
+  - `family-match` for a high-confidence known model family with an unknown
+    build hash;
+  - `structural-match` for a valid container and plausible AE structures whose
+    model or sensor identity is not verified;
+  - `unsupported` when required structures are missing or contradictory.
+- `--compat-check` to classify an image and print the evidence, confidence,
+  score, warnings, detected build strings, sensor markers, runtimes, and AE
+  candidates without patching.
+- Analysis/compatibility manifests from `--scan --manifest` and
+  `--compat-check --manifest`, including candidate curves and relative context
+  fingerprints. Scan manifests can now be used as a cryptographic safety gate
+  for later writes.
+- `--compare-layout LAYOUT` to compare an unknown build with a known generation:
+  candidate counts, original curves, absolute offsets, required markers, and
+  relative SDK context are reported separately.
+- `--export-layout FILE` to create an explicitly unverified JSON profile
+  candidate for manual review and pull requests.
+- A fail-closed expert workflow for unknown builds:
+  - `--allow-unverified` acknowledges the risk;
+  - `--expect-ir [OFFSET=]V1,...,V21` asserts every selected original curve;
+  - `--accept-scan-manifest FILE` binds a real write to a previous scan with the
+    same input SHA-256, offsets, and original curves.
+- Data-driven profile loading from bundled `profiles/*.json` files and optional
+  repeatable `--profile-dir` directories.
+- `--trust-external-profiles` as an explicit opt-in after independent review.
+  External profiles are recognition-only by default and cannot override trusted
+  bundled profiles.
+- Relative AE context fingerprints. Profiles can validate stable data after
+  `tab_ratio_ir` and the characteristic over-exposure threshold block instead
+  of relying only on absolute offsets or short byte signatures.
+- Repository smoke tests for profile schemas, registry loading, versioning, and
+  original-curve assertion parsing.
+
+### Changed
+
+- **Breaking safety change:** unknown firmware is never labeled `single` merely
+  because one candidate was found in a runtime. Without independent family
+  evidence, all candidates remain `unidentified`.
+- **Breaking safety change:** a probable model-family match may be scanned and
+  sensor-labeled, but it cannot use an automatic profile or ordinary write mode.
+- **Breaking safety change:** a `structural-match` requires explicit
+  `--ir-offset` targets; guessed sensor selection is not accepted.
+- **Breaking safety change:** a real write on any non-`verified` image requires
+  a previously generated and accepted scan manifest. Default output names
+  contain `_UNVERIFIED_PATCHED`.
+- HC-940Ultra, HC-950Ultra, and HC-960Ultra family detection now combines build
+  prefixes, required markers, runtime presence, exact candidate counts, and
+  relative SDK context. Candidate-count mismatches disable family assignment.
+- Known firmware knowledge is separated from the parser/checksum code through
+  schema-versioned JSON profiles. Built-in conservative fallbacks remain for
+  standalone-script use.
+- `--verify-only` remains a fast checksum-only operation. Unknown hashes are not
+  structurally classified until `--compat-check` or `--scan` is run.
+- `--list-profiles` now prints trust state and source path for every profile and
+  layout.
+- Patch and analysis manifests now include a schema, manifest type, support
+  assessment, confidence, reasons, warnings, build markers, and profile source.
+
+### Safety
+
+- Unknown dual-camera firmware cannot be silently treated as single-camera when
+  one sensor's AE structure changes or becomes temporarily undetectable.
+- HC-950 family sensor labels are assigned only when both normal/remote and
+  low-power/PIR runtimes each contain exactly two candidates and all other
+  family checks pass. Any missing or extra candidate falls back to
+  `structural-match`.
+- Untrusted profile directories cannot replace a trusted official layout or
+  automatic profile unless the user explicitly enables
+  `--trust-external-profiles`.
+- Original-curve assertions are checked before any checksum or firmware write.
+- Accepted scan manifests are checked against the current input SHA-256, every
+  selected offset, and every selected original curve.
+
+### Validation notes
+
+- Python compilation and all bundled unit tests pass on Python 3.13.
+- Exact HC-960Ultra automatic-profile output remains:
+  `a66190b5f418a2e54c09042f154411777bb2b3f7ec339023a1331442600c4667`.
+- Exact HC-940Ultra automatic-profile output remains:
+  `a0a7b94cc9e1c4e7da51b8ddf4c8b18a619d2acecf8b874247ca3669e5bf9a53`.
+- Exact HC-950Ultra 2026 test-only `--ir 109` output remains:
+  `da957f032d0d06c83a07a2f9791acc1c3d02e83642c8db3332cf8f1e1f63ee2a`.
+- A checksum-valid synthetic unknown HC-950 build was classified as
+  `family-match`, selected only the probable SC223AP night tables, rejected a
+  dry run without `--allow-unverified`, rejected a dry run without
+  `--expect-ir`, and rejected a real write without an accepted scan manifest.
+- The same synthetic image with one deliberately unrecognizable AE candidate
+  was downgraded to `structural-match`; it was not mislabeled as a single-camera
+  firmware.
+- An accepted unverified write used the visible `_UNVERIFIED_PATCHED` name and
+  passed all internal checksums, the outer checksum, target-curve verification,
+  changed-byte whitelisting, and disk round-trip verification.
+- Synthetic images and hashes are test artifacts only and are not distributed
+  or recommended for flashing.
+
+## [2.2.0] - 2026-07-16
+
+### Added
+
+- Verified recognition for the newer HC-950Ultra / `950XFUltra_20260527`
+  manufacturer firmware with BIN SHA-256
+  `a6caf6be7e1a77dfe434ae78b959390b190f2e3b6e9b6e0cb5c8b29b2e6edf61`.
+- A second strict HC-950 dual-camera layout containing all four sensor/runtime
+  identities:
+  - normal/remote IMX258M day camera at `0x006c2de4`;
+  - normal/remote SC223AP night camera at `0x006c3a88`;
+  - low-power/PIR IMX258M day camera at `0x01834710`;
+  - low-power/PIR SC223AP night camera at `0x018353d8`.
+- Build-string validation for both known HC-950 images:
+  `950XFUltra_20240808` and `950XFUltra_20260527`.
+- Documentation and regression vectors for both verified HC-950 generations.
+
+### Changed
+
+- The HC-950 layout names now include their generation:
+  `hc950-dual-camera-2024` and `hc950-dual-camera-2026`.
+- `--list-profiles` now lists both recognized HC-950 builds separately while
+  keeping them distinct from automatic exposure profiles.
+- The 2026 HC-950 layout validates its mixed original curves exactly: the
+  normal/remote IMX258M table uses `110..125`, while the other three tables use
+  `110 x21`.
+- README examples now cover verification, scanning, sensor selection, runtime
+  selection, and fail-closed offset handling on the 2026 firmware.
+
+### Safety
+
+- There is still **no automatic HC-950Ultra exposure profile** for either
+  firmware generation. Factory night exposure was reported as good, so a patch
+  requires an explicit `--ir`, `--ir-scale`, or `--ir-values` request.
+- Explicit HC-950 custom changes continue to default to the SC223AP night sensor
+  in both runtimes. The IMX258M day tables remain untouched unless selected.
+- Offsets are never shared between the 2024 and 2026 images. Exact SHA-256,
+  runtime role, table offset, expected original curve, and sensor/build markers
+  must all match before sensor-aware selection is enabled.
+
+### Validation notes
+
+- All detectable internal checksums and the outer NVTPACK checksum reproduce on
+  the original `950XFUltra_20260527` image.
+- A test-only `--ir 109 --dry-run` selects only the two SC223AP night tables and
+  produces BIN SHA-256
+  `da957f032d0d06c83a07a2f9791acc1c3d02e83642c8db3332cf8f1e1f63ee2a`.
+- `--sensor day --ir 109 --dry-run` produces
+  `31f159f0ff5fda2851bf4639e8aabaa64efc7c3239871deed6b38575c5f6ba27`.
+- `--sensor all --ir 109 --dry-run` produces
+  `a38629736a38416bbeb102b7318ad9fd7c5008a69af96acf529d56a333e133cf`.
+- A real ZIP write with the default SC223AP test selection passed output ZIP
+  preservation, JSON manifest generation, byte whitelist, checksum updates,
+  and disk/ZIP round-trip verification.
+- HC-960Ultra, HC-940Ultra, and HC-950Ultra 2024 regression hashes remain
+  unchanged from version 2.1.0.
+- The HC-950 hashes above are software test vectors, not recommended firmware
+  images.
+
 ## [2.1.0] - 2026-07-16
 
 ### Added

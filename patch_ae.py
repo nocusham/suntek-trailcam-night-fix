@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Patch night/IR auto-exposure tables in Suntek/Novatek trail-camera firmware.
 
-Version 2 patches every detected camera runtime by default. This is important on
-firmware that contains a normal/remote runtime and a separate low-power/PIR
-runtime, each with its own ``tab_ratio_ir`` table.
+Version 2 patches every detected camera runtime by default. Version 2.1 also
+recognizes dual-camera firmware where each runtime contains separate day- and
+night-sensor AE configurations.
 
 The tool accepts a raw ``.bin`` image or a manufacturer ``.zip`` containing one
 ``.bin`` file. It validates the NVTPACK container, all detectable internal
@@ -13,6 +13,8 @@ post-patch byte whitelist before writing an output file.
 Tested firmware layouts:
   * HC-960Ultra, build 2026-03-26
   * HC-940Ultra, build 2025-04-23
+  * HC-950Ultra / 950XFUltra, build 2024-08-08 (dual camera; recognition only,
+    no exposure change is recommended by default)
 
 Firmware flashing can permanently brick hardware. Keep the exact original
 firmware and use this tool at your own risk. No manufacturer firmware is
@@ -30,12 +32,12 @@ import sys
 import tempfile
 import zipfile
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 HDR2_VERSION_OFF = 0x10
 HDR2_VERSION = 0x16071515
@@ -63,8 +65,14 @@ ROLE_NORMAL = "normal/remote"
 ROLE_PIR = "low-power/PIR"
 ROLE_OTHER = "camera-runtime"
 
+SENSOR_SINGLE = "single"
+SENSOR_DAY = "day"
+SENSOR_NIGHT = "night"
+SENSOR_UNKNOWN = "unknown"
+
 HC960_SHA256 = "b391abec2bdf6ab1d48e357c94e0f56bb9e2703899b647609acec3faa30150fa"
 HC940_SHA256 = "9eb10ef5dd4057a891fb48a2b9cb9165e9ae3168a9b7e58aecc6299b90749c4a"
+HC950_SHA256 = "e4db261f9228af5793d5952b45f9b6e9e41b2a50e264ac8971e5145d8cc19370"
 
 HC960_ORIGINAL = (110,) * AE_ENTRIES
 HC960_AE55 = (55,) * AE_ENTRIES
@@ -190,6 +198,33 @@ class AECandidate:
     photo_curve: Tuple[int, ...]
     ir_curve: Tuple[int, ...]
     over_exposure_delta: int
+    sensor_key: str = SENSOR_UNKNOWN
+    sensor_model: Optional[str] = None
+    sensor_role: str = SENSOR_UNKNOWN
+
+
+@dataclass(frozen=True)
+class CandidateIdentity:
+    partition_id: int
+    runtime_role: str
+    ir_offset: int
+    sensor_key: str
+    sensor_model: Optional[str]
+    sensor_role: str
+    expected_curve: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class FirmwareLayout:
+    name: str
+    model: str
+    build: str
+    sha256: str
+    camera_design: str
+    candidates: Tuple[CandidateIdentity, ...]
+    required_strings: Tuple[bytes, ...] = ()
+    default_patch_sensor: Optional[str] = None
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -224,6 +259,61 @@ PROFILES: Dict[str, Profile] = {
     ),
 }
 PROFILE_BY_SHA = {profile.sha256: profile for profile in PROFILES.values()}
+
+
+FIRMWARE_LAYOUTS: Dict[str, FirmwareLayout] = {
+    HC960_SHA256: FirmwareLayout(
+        name="hc960-single-camera",
+        model="HC-960Ultra",
+        build="2026-03-26",
+        sha256=HC960_SHA256,
+        camera_design="single camera module",
+        candidates=(
+            CandidateIdentity(3, ROLE_NORMAL, 0x006CB628, SENSOR_SINGLE, None, SENSOR_SINGLE, HC960_ORIGINAL),
+            CandidateIdentity(9, ROLE_PIR, 0x0182DFC0, SENSOR_SINGLE, None, SENSOR_SINGLE, HC960_ORIGINAL),
+        ),
+        default_patch_sensor="all",
+        note="One AE configuration per runtime.",
+    ),
+    HC940_SHA256: FirmwareLayout(
+        name="hc940-single-camera",
+        model="HC-940Ultra",
+        build="2025-04-23",
+        sha256=HC940_SHA256,
+        camera_design="single camera module",
+        candidates=(
+            CandidateIdentity(3, ROLE_NORMAL, 0x006CB8CC, SENSOR_SINGLE, None, SENSOR_SINGLE, HC940_ORIGINAL),
+            CandidateIdentity(9, ROLE_PIR, 0x0188EDE4, SENSOR_SINGLE, None, SENSOR_SINGLE, HC940_ORIGINAL),
+        ),
+        default_patch_sensor="all",
+        note="One AE configuration per runtime.",
+    ),
+    HC950_SHA256: FirmwareLayout(
+        name="hc950-dual-camera",
+        model="HC-950Ultra / 950XFUltra",
+        build="2024-08-08",
+        sha256=HC950_SHA256,
+        camera_design="dual camera modules: IMX258M day + SC223AP night",
+        candidates=(
+            CandidateIdentity(3, ROLE_NORMAL, 0x006C2C60, "imx258m", "IMX258M", SENSOR_DAY, HC960_ORIGINAL),
+            CandidateIdentity(3, ROLE_NORMAL, 0x006C3904, "sc223ap", "SC223AP", SENSOR_NIGHT, HC960_ORIGINAL),
+            CandidateIdentity(9, ROLE_PIR, 0x01893924, "imx258m", "IMX258M", SENSOR_DAY, HC960_ORIGINAL),
+            CandidateIdentity(9, ROLE_PIR, 0x018945EC, "sc223ap", "SC223AP", SENSOR_NIGHT, HC960_ORIGINAL),
+        ),
+        required_strings=(
+            b"CMOS_IMX258M",
+            b"CMOS_SC223AP",
+            b"AE_PARAM_IMX258_EVB",
+            b"AE_PARAM_SC223A_EVB",
+        ),
+        default_patch_sensor=SENSOR_NIGHT,
+        note=(
+            "Factory night exposure is reported as good. The firmware is recognized "
+            "and all four AE configurations can be selected, but there is no automatic "
+            "HC-950 exposure target."
+        ),
+    ),
+}
 
 
 @dataclass
@@ -559,25 +649,22 @@ def find_all_ae_candidates(
     data: bytes | bytearray,
     partitions: Sequence[Partition],
 ) -> List[AECandidate]:
+    """Find every structurally valid AE configuration in every runtime.
+
+    Multiple exact matches in one runtime are valid on dual-camera firmware. The
+    identity/selection layer decides whether they are a verified sensor layout or
+    an unknown ambiguous layout.
+    """
     exact: List[AECandidate] = []
     for part in partitions:
-        hits = find_ae_candidates_in_partition(data, part, exact_only=True)
-        if len(hits) > 1:
-            details = ", ".join(f"0x{hit.ir_offset:x}" for hit in hits)
-            raise PatchError(
-                f"multiple exact AE structures in partition id {part.pid}: {details}; "
-                "use --ir-offset to select explicitly"
-            )
-        exact.extend(hits)
+        exact.extend(find_ae_candidates_in_partition(data, part, exact_only=True))
     if exact:
-        return exact
+        return sorted(exact, key=lambda candidate: candidate.ir_offset)
 
     # Conservative fallback for a related SDK layout where over_exposure moved.
     fallback: List[AECandidate] = []
     for part in partitions:
         hits = find_ae_candidates_in_partition(data, part, exact_only=False)
-        # Reduce generic false positives by requiring the original night curve to
-        # be pointwise at least as high as the photo curve.
         hits = [
             hit
             for hit in hits
@@ -587,17 +674,144 @@ def find_all_ae_candidates(
             )
             and hit.ir_curve != hit.photo_curve
         ]
-        if len(hits) > 1:
-            details = ", ".join(
-                f"0x{hit.ir_offset:x}(OE+0x{hit.over_exposure_delta:x})"
-                for hit in hits
-            )
-            raise PatchError(
-                f"ambiguous fallback AE structures in partition id {part.pid}: "
-                f"{details}; use --ir-offset"
-            )
         fallback.extend(hits)
-    return fallback
+    if len(fallback) > 16:
+        raise PatchError(
+            f"fallback AE search produced {len(fallback)} candidates; use "
+            "--ir-offset only after manual analysis"
+        )
+    return sorted(fallback, key=lambda candidate: candidate.ir_offset)
+
+
+def candidates_from_layout(
+    data: bytes | bytearray,
+    partitions: Sequence[Partition],
+    layout: FirmwareLayout,
+) -> List[AECandidate]:
+    """Resolve a verified layout directly without scanning entire runtime images."""
+    by_pid: Dict[int, List[Partition]] = {}
+    for partition in partitions:
+        by_pid.setdefault(partition.pid, []).append(partition)
+    candidates: List[AECandidate] = []
+    for identity in layout.candidates:
+        matching = [
+            partition
+            for partition in by_pid.get(identity.partition_id, [])
+            if partition.role == identity.runtime_role
+        ]
+        if len(matching) != 1:
+            raise PatchError(
+                f"{layout.model} expected exactly one partition id "
+                f"{identity.partition_id} with role {identity.runtime_role}"
+            )
+        candidate = candidate_at_ir_offset(
+            data, matching[0], identity.ir_offset, exact_only=True
+        )
+        if candidate is None:
+            raise PatchError(
+                f"{layout.model} expected an AE structure at "
+                f"0x{identity.ir_offset:x} in partition id {identity.partition_id}"
+            )
+        candidates.append(candidate)
+    return sorted(candidates, key=lambda candidate: candidate.ir_offset)
+
+
+def identify_candidates(
+    data: bytes | bytearray,
+    digest: str,
+    candidates: Sequence[AECandidate],
+    *,
+    require_complete_layout: bool,
+) -> Tuple[List[AECandidate], Optional[FirmwareLayout]]:
+    """Attach verified sensor identities to AE candidates.
+
+    Exact known firmware hashes use a strict map of partition ID, runtime role,
+    table offset and original curve. Unknown single-candidate runtimes are marked
+    as a combined/single sensor. Unknown multi-candidate runtimes remain
+    unidentified and cannot be patched without explicit offsets.
+    """
+    layout = FIRMWARE_LAYOUTS.get(digest)
+    if layout is not None:
+        for marker in layout.required_strings:
+            if marker not in data:
+                raise PatchError(
+                    f"recognized {layout.model} hash but required marker "
+                    f"{marker.decode('ascii', 'replace')!r} is missing"
+                )
+        identity_by_key = {
+            (identity.partition_id, identity.ir_offset): identity
+            for identity in layout.candidates
+        }
+        candidate_by_key = {
+            (candidate.partition.pid, candidate.ir_offset): candidate
+            for candidate in candidates
+        }
+        if require_complete_layout and set(candidate_by_key) != set(identity_by_key):
+            expected = ", ".join(
+                f"pid {pid}:0x{offset:x}" for pid, offset in sorted(identity_by_key)
+            )
+            actual = ", ".join(
+                f"pid {pid}:0x{offset:x}" for pid, offset in sorted(candidate_by_key)
+            ) or "none"
+            raise PatchError(
+                f"{layout.model} layout mismatch; expected [{expected}], found [{actual}]"
+            )
+        identified: List[AECandidate] = []
+        for candidate in candidates:
+            identity = identity_by_key.get((candidate.partition.pid, candidate.ir_offset))
+            if identity is None:
+                raise PatchError(
+                    f"unexpected AE table in recognized {layout.model} image: "
+                    f"pid {candidate.partition.pid} offset 0x{candidate.ir_offset:x}"
+                )
+            if candidate.partition.role != identity.runtime_role:
+                raise PatchError(
+                    f"runtime-role mismatch at 0x{candidate.ir_offset:x}: "
+                    f"{candidate.partition.role} != {identity.runtime_role}"
+                )
+            if candidate.ir_curve != identity.expected_curve:
+                raise PatchError(
+                    f"original curve mismatch for {layout.model} {identity.sensor_key} "
+                    f"at 0x{candidate.ir_offset:x}: "
+                    f"{format_curve(candidate.ir_curve)} != "
+                    f"{format_curve(identity.expected_curve)}"
+                )
+            identified.append(
+                replace(
+                    candidate,
+                    sensor_key=identity.sensor_key,
+                    sensor_model=identity.sensor_model,
+                    sensor_role=identity.sensor_role,
+                )
+            )
+        return sorted(identified, key=lambda candidate: candidate.ir_offset), layout
+
+    groups: Dict[int, List[AECandidate]] = {}
+    for candidate in candidates:
+        groups.setdefault(candidate.partition.index, []).append(candidate)
+    identified = []
+    for group in groups.values():
+        ordered = sorted(group, key=lambda candidate: candidate.ir_offset)
+        if len(ordered) == 1:
+            identified.append(
+                replace(
+                    ordered[0],
+                    sensor_key=SENSOR_SINGLE,
+                    sensor_model=None,
+                    sensor_role=SENSOR_SINGLE,
+                )
+            )
+        else:
+            for index, candidate in enumerate(ordered, 1):
+                identified.append(
+                    replace(
+                        candidate,
+                        sensor_key=f"unidentified-{index}",
+                        sensor_model=None,
+                        sensor_role=SENSOR_UNKNOWN,
+                    )
+                )
+    return sorted(identified, key=lambda candidate: candidate.ir_offset), None
 
 
 def partition_containing(
@@ -638,46 +852,82 @@ def resolve_manual_candidates(
     return candidates
 
 
+def _runtime_matches(candidate: AECandidate, selector: str) -> bool:
+    normalized = selector.lower()
+    if normalized in ("normal", "remote"):
+        return candidate.partition.role == ROLE_NORMAL
+    if normalized in ("pir", "low-power", "lowpower"):
+        return candidate.partition.role == ROLE_PIR
+    if normalized.startswith("pid:"):
+        try:
+            return candidate.partition.pid == int(normalized.split(":", 1)[1], 0)
+        except ValueError as exc:
+            raise PatchError(f"invalid runtime selector: {selector}") from exc
+    if normalized.isdigit():
+        return candidate.partition.pid == int(normalized)
+    if normalized == "all":
+        return True
+    raise PatchError(f"unknown runtime selector: {selector}")
+
+
+def _sensor_matches(candidate: AECandidate, selector: str) -> bool:
+    normalized = selector.lower().replace("_", "-")
+    compact = normalized.replace("-", "")
+    if normalized == "all":
+        return True
+    if normalized in (SENSOR_DAY, SENSOR_NIGHT, SENSOR_SINGLE):
+        return candidate.sensor_role == normalized or candidate.sensor_key == normalized
+    if compact in ("imx258", "imx258m"):
+        return candidate.sensor_key == "imx258m"
+    if compact in ("sc223a", "sc223ap"):
+        return candidate.sensor_key == "sc223ap"
+    return candidate.sensor_key.lower() == normalized
+
+
 def select_candidates(
-    candidates: Sequence[AECandidate], selectors: Sequence[str]
+    candidates: Sequence[AECandidate],
+    runtime_selectors: Sequence[str],
+    sensor_selectors: Sequence[str],
+    layout: Optional[FirmwareLayout],
 ) -> List[AECandidate]:
     if not candidates:
         raise PatchError(
             "no AE runtime found; use --ir-offset only after manually confirming "
             "the table and partition"
         )
-    if not selectors or "all" in selectors:
-        return list(candidates)
 
-    selected: List[AECandidate] = []
-    for candidate in candidates:
-        wanted = False
-        for selector in selectors:
-            normalized = selector.lower()
-            if normalized in ("normal", "remote") and candidate.partition.role == ROLE_NORMAL:
-                wanted = True
-            elif normalized in ("pir", "low-power", "lowpower") and candidate.partition.role == ROLE_PIR:
-                wanted = True
-            elif normalized.startswith("pid:"):
-                try:
-                    wanted |= candidate.partition.pid == int(normalized.split(":", 1)[1], 0)
-                except ValueError as exc:
-                    raise PatchError(f"invalid runtime selector: {selector}") from exc
-            elif normalized.isdigit():
-                wanted |= candidate.partition.pid == int(normalized)
-            elif normalized not in (
-                "normal",
-                "remote",
-                "pir",
-                "low-power",
-                "lowpower",
-            ) and not normalized.startswith("pid:"):
-                raise PatchError(f"unknown runtime selector: {selector}")
-        if wanted:
-            selected.append(candidate)
-    if not selected:
-        raise PatchError("--runtime selection matched no detected AE runtime")
-    return selected
+    selected = list(candidates)
+    if any(candidate.sensor_role == SENSOR_UNKNOWN for candidate in selected):
+        raise PatchError(
+            "multiple unidentified AE configurations exist in at least one runtime; "
+            "use --ir-offset for every manually verified table"
+        )
+
+    if runtime_selectors and "all" not in [value.lower() for value in runtime_selectors]:
+        selected = [
+            candidate
+            for candidate in selected
+            if any(_runtime_matches(candidate, selector) for selector in runtime_selectors)
+        ]
+        if not selected:
+            raise PatchError("--runtime selection matched no detected AE configuration")
+
+    if sensor_selectors:
+        selected = [
+            candidate
+            for candidate in selected
+            if any(_sensor_matches(candidate, selector) for selector in sensor_selectors)
+        ]
+        if not selected:
+            raise PatchError("--sensor selection matched no detected AE configuration")
+    elif layout is not None and layout.default_patch_sensor not in (None, "all"):
+        selected = [
+            candidate
+            for candidate in selected
+            if _sensor_matches(candidate, layout.default_patch_sensor)
+        ]
+
+    return sorted(selected, key=lambda candidate: candidate.ir_offset)
 
 
 def parse_curve(text: str) -> Tuple[int, ...]:
@@ -710,7 +960,11 @@ def scale_curve(values: Sequence[int], factor: float) -> Tuple[int, ...]:
     return scaled
 
 
-def resolve_profile(args: argparse.Namespace, digest: str) -> Optional[Profile]:
+def resolve_profile(
+    args: argparse.Namespace,
+    digest: str,
+    layout: Optional[FirmwareLayout],
+) -> Optional[Profile]:
     if args.profile and args.profile != "auto":
         profile = PROFILES[args.profile]
         if digest != profile.sha256:
@@ -724,6 +978,13 @@ def resolve_profile(args: argparse.Namespace, digest: str) -> Optional[Profile]:
     ):
         profile = PROFILE_BY_SHA.get(digest)
         if profile is None:
+            if layout is not None:
+                raise PatchError(
+                    f"recognized {layout.model} build {layout.build}, but no automatic "
+                    "exposure patch is recommended. Run --scan; to experiment, choose "
+                    "--ir, --ir-scale, or --ir-values. On the HC-950 layout the "
+                    "verified default selection is the SC223AP night sensor."
+                )
             raise PatchError(
                 "input SHA-256 has no automatic profile; choose --ir, --ir-scale, "
                 "or --ir-values after reviewing the detected original curves"
@@ -736,8 +997,9 @@ def build_targets(
     args: argparse.Namespace,
     digest: str,
     candidates: Sequence[AECandidate],
+    layout: Optional[FirmwareLayout],
 ) -> Tuple[List[PatchTarget], str, Optional[Profile]]:
-    profile = resolve_profile(args, digest)
+    profile = resolve_profile(args, digest, layout)
     targets: List[PatchTarget] = []
     if profile is not None:
         if len(candidates) != 2 or {c.partition.role for c in candidates} != {
@@ -1023,6 +1285,7 @@ def build_manifest(
     output_path: Optional[Path],
     mode: str,
     profile: Optional[Profile],
+    layout: Optional[FirmwareLayout],
     partitions: Sequence[Partition],
     targets: Sequence[PatchTarget],
     checksum_changes: Sequence[ChecksumChange],
@@ -1055,12 +1318,26 @@ def build_manifest(
             if profile
             else None
         ),
+        "recognized_layout": (
+            {
+                "name": layout.name,
+                "model": layout.model,
+                "build": layout.build,
+                "camera_design": layout.camera_design,
+                "note": layout.note,
+            }
+            if layout
+            else None
+        ),
         "targets": [
             {
                 "partition_id": target.candidate.partition.pid,
                 "role": target.candidate.partition.role,
                 "load_address": f"0x{target.candidate.partition.load_address:08x}",
                 "ir_offset": f"0x{target.candidate.ir_offset:08x}",
+                "sensor_key": target.candidate.sensor_key,
+                "sensor_model": target.candidate.sensor_model,
+                "sensor_role": target.candidate.sensor_role,
                 "original_curve": list(target.candidate.ir_curve),
                 "new_curve": list(target.new_curve),
             }
@@ -1108,10 +1385,11 @@ def build_manifest(
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Patch all detected Suntek/Novatek night-AE runtimes safely.",
+        description="Patch Suntek/Novatek night-AE runtimes and sensor configurations safely.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Automatic profiles are available only for exact verified firmware SHA-256 values.\n"
+            "Automatic patch profiles are available only for exact verified firmware SHA-256 values.\n"
+            "HC-950Ultra is recognized but has no automatic exposure patch.\n"
             "Unknown firmware requires --ir, --ir-scale, or --ir-values."
         ),
     )
@@ -1145,6 +1423,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=[],
         metavar="all|normal|pir|PID",
         help="select runtimes; repeatable (default: all detected runtimes)",
+    )
+    parser.add_argument(
+        "--sensor",
+        action="append",
+        default=[],
+        metavar="all|day|night|single|MODEL",
+        help=(
+            "select camera sensor; repeatable. Recognized HC-950 custom patches "
+            "default to the SC223AP night sensor"
+        ),
     )
     parser.add_argument(
         "--ir-offset",
@@ -1193,12 +1481,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def print_profiles() -> None:
+    print("Automatic patch profiles:")
     for profile in PROFILES.values():
         print(
             f"{profile.name}: {profile.model}, build {profile.build}, "
             f"SHA-256 {profile.sha256}\n"
             f"  original: {format_curve(profile.expected_curve)}\n"
             f"  target  : {format_curve(profile.target_curve)}"
+        )
+    print("\nRecognized firmware layouts:")
+    for layout in FIRMWARE_LAYOUTS.values():
+        automatic = next(
+            (profile.name for profile in PROFILES.values() if profile.sha256 == layout.sha256),
+            "none (recognition/explicit patch only)",
+        )
+        print(
+            f"{layout.name}: {layout.model}, build {layout.build}, "
+            f"SHA-256 {layout.sha256}\n"
+            f"  design  : {layout.camera_design}\n"
+            f"  auto    : {automatic}\n"
+            f"  note    : {layout.note}"
         )
 
 
@@ -1215,8 +1517,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         value is not None for value in (args.ir, args.ir_scale, args.ir_values, args.profile)
     ):
         raise PatchError("patch-mode options cannot be combined with --verify-only")
-    if args.ir_offset and args.runtime:
-        raise PatchError("use either --ir-offset or --runtime selection, not both")
+    if args.ir_offset and (args.runtime or args.sensor):
+        raise PatchError(
+            "use either --ir-offset or --runtime/--sensor selection, not both"
+        )
     if (args.iso_cap is None) != (not args.iso_offset):
         raise PatchError("--iso-cap and at least one --iso-offset must be used together")
 
@@ -1230,21 +1534,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not valid:
         raise PatchError("input checksum verification failed; use a pristine firmware image")
 
+    layout = FIRMWARE_LAYOUTS.get(input_sha)
+    if layout is not None:
+        log(
+            "model",
+            f"recognized {layout.model}, build {layout.build}; {layout.camera_design}",
+        )
+        log("model", layout.note)
+
     if args.verify_only:
         log("done", f"all verifiable checksums are valid; SHA-256 {input_sha}")
         return 0
 
     if args.ir_offset:
         candidates = resolve_manual_candidates(original, partitions, args.ir_offset)
+        candidates, layout = identify_candidates(
+            original, input_sha, candidates, require_complete_layout=False
+        )
     else:
-        candidates = find_all_ae_candidates(original, partitions)
-        candidates = select_candidates(candidates, args.runtime)
+        if layout is not None:
+            candidates = candidates_from_layout(original, partitions, layout)
+        else:
+            candidates = find_all_ae_candidates(original, partitions)
+        candidates, layout = identify_candidates(
+            original, input_sha, candidates, require_complete_layout=True
+        )
 
     for candidate in sorted(candidates, key=lambda item: item.ir_offset):
         log(
             "scan",
             f"partition id {candidate.partition.pid} ({candidate.partition.role}), "
             f"load=0x{candidate.partition.load_address:08x}, "
+            f"sensor={candidate.sensor_key} ({candidate.sensor_role}), "
             f"tab_ratio_ir=0x{candidate.ir_offset:08x}, "
             f"curve={format_curve(candidate.ir_curve)}, "
             f"over_exposure=IR+0x{candidate.over_exposure_delta:x}",
@@ -1254,7 +1575,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log("done", f"scan complete; input SHA-256 {input_sha}")
         return 0
 
-    targets, mode, profile = build_targets(args, input_sha, candidates)
+    if not args.ir_offset:
+        candidates = select_candidates(
+            candidates, args.runtime, args.sensor, layout
+        )
+
+    targets, mode, profile = build_targets(args, input_sha, candidates, layout)
     for target in targets:
         log(
             "plan",
@@ -1290,6 +1616,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output_path=None if args.dry_run else destination,
         mode=mode,
         profile=profile,
+        layout=layout,
         partitions=partitions,
         targets=targets,
         checksum_changes=checksum_changes,

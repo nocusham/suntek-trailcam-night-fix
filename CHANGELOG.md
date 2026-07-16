@@ -4,6 +4,72 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-07-16
+
+### Added
+
+- Verified recognition for the HC-950Ultra / `950XFUltra_20240808` manufacturer
+  firmware with BIN SHA-256
+  `e4db261f9228af5793d5952b45f9b6e9e41b2a50e264ac8971e5145d8cc19370`.
+- Dual-camera sensor identities for the HC-950Ultra:
+  - IMX258M day camera;
+  - SC223AP night camera.
+- Detection and labeling of all four HC-950Ultra AE configurations: day and
+  night sensors in both the normal/remote and low-power/PIR runtimes.
+- Repeatable `--sensor` selection with `single`, `day`, `night`, `imx258m`,
+  `sc223ap`, and `all` selectors.
+- Sensor and recognized-layout metadata in JSON manifests.
+- A recognized-layout registry that validates exact partition IDs, runtime
+  roles, AE offsets, original curves, and required sensor marker strings.
+- Documentation for the HC-950Ultra two-stage update: `FWHC940A.bin` is the
+  Novatek camera-system firmware handled by this tool; the separate `.pac` plus
+  `upgrade_tool` package updates the 4G modem and is out of scope.
+
+### Changed
+
+- Known firmware layouts are now resolved directly from verified offsets instead
+  of scanning every 4-byte position in multi-megabyte runtime partitions. This
+  significantly speeds up `--scan`, profile patching, and dry runs on all three
+  verified builds while retaining full structural validation.
+- On the exact HC-950Ultra layout, an explicit custom curve without `--sensor`
+  defaults to the SC223AP night sensor in both runtimes. The IMX258M day tables
+  remain unchanged unless `--sensor day`, `--sensor imx258m`, or `--sensor all`
+  is explicitly selected.
+- `--list-profiles` now separates automatic exposure profiles from recognized
+  firmware layouts.
+- Scan output now includes sensor key and sensor role for every AE candidate.
+- Documentation now distinguishes firmware recognition from a recommended
+  exposure patch.
+
+### Safety
+
+- There is deliberately **no automatic HC-950Ultra exposure profile**. Supplied
+  night images were correctly exposed, so invoking the tool without an explicit
+  curve mode stops with an explanatory message rather than creating a patch.
+- Unknown firmware with multiple AE structures in one runtime can still be
+  scanned, but cannot be patched through guessed sensor grouping. Each target
+  must be supplied with a manually verified `--ir-offset`.
+- Manual `--ir-offset` selection cannot be combined with `--runtime` or
+  `--sensor`, preventing conflicting target descriptions.
+- ISO offsets remain expert-only and are not automatically associated with a
+  specific sensor on dual-camera firmware.
+
+### Validation notes
+
+- HC-960Ultra automatic-profile output remains
+  `a66190b5f418a2e54c09042f154411777bb2b3f7ec339023a1331442600c4667`.
+- HC-940Ultra automatic-profile output remains
+  `a0a7b94cc9e1c4e7da51b8ddf4c8b18a619d2acecf8b874247ca3669e5bf9a53`.
+- HC-950Ultra test-only `--ir 109 --dry-run` defaults to the two SC223AP night
+  tables and produces the regression BIN SHA-256
+  `a03b34e0b24f5dde27a3b39598d69f38c5ff064e75a98775c3b3c567fcadbb3c`.
+  This hash is a software test vector, not a recommended firmware image.
+- HC-950Ultra `--sensor day --ir 109 --dry-run` selects exactly the two IMX258M
+  tables; `--sensor all` selects all four tables.
+- All original detectable partition checksums and the outer NVTPACK checksum
+  reproduce before patching, and every test output passes in-memory and
+  round-trip verification.
+
 ## [2.0.0] - 2026-07-15
 
 ### Added
